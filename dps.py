@@ -59,8 +59,3 @@ step_sizes = np.full((N,), 0.01)  # [***] hold constant? they said [0.01, 0.1] i
 # print("Names of Tensors Stored in the Model:")
 # for key in model.keys():
 #     print(key)
-
-
-# [1]: Chung et al DPS paper: 
-# [2]: Ho et al DDPM gaussian-diffusion github code: https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/diffusion_utils_2.py#L42
-# [3]: Open AI guided-diffusion github code: https://github.com/openai/guided-diffusion/blob/main/guided_diffusion/gaussian_diffusion.py 
