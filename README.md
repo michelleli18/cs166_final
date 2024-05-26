@@ -1,4 +1,4 @@
-# cs166_final
+# CS 166 Final Project: Diffusion Posterior Sampling
 
 Implementation of Diffusion Posterior Sampling (DPS, [1]) using pre-trained diffusion models from DPS 2022 github code. Referencing DDPM initialization code from Ho et al [2][3]. <br />
 <br />
