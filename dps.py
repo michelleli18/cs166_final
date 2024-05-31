@@ -92,8 +92,7 @@ class DPS:
         for i in pbar:
             # s = self.model(x, timestep_embs[i])
             s = self.model(x, torch.tensor([i]).to(self.device))
-            print("YIAIII")
-            # s = self.model(torch.zeros((1, 3, 256, 256)), torch.tensor([i]).to(self.device))
+            print("PLS CHILL", s.shape)
             x0_hat = 1/(self.alpha_bars[i]) * (x + (self.one_minus_abars_t[i])*s) # x0_hat := E[x_0 | x_t]
             
             # First do original DDPM posterior sampling for q(x_{t-1} | x_t)
