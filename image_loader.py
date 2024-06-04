@@ -18,7 +18,7 @@ class ImageLoader(Dataset):
         
         if self.transform:
             image = self.transform(image)
-            image = np.transpose(image, (1, 2, 0))
+            # image = np.transpose(image, (1, 2, 0))
         
         return image
 

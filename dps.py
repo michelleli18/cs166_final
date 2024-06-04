@@ -21,13 +21,15 @@ class DPS:
         
         # Set up the model using dps_unet code (without modifications) and its corresponding model_config.yaml [2]
         self.model_noise_type = model_noise_type
-        self.model = unet.create_model(image_size=256, num_channels=128, num_res_blocks=1, channel_mult="", learn_sigma=True, class_cond=False, use_checkpoint=False, attention_resolutions="16", num_heads=4, num_head_channels=64, num_heads_upsample=-1,use_scale_shift_norm=True, dropout=0, resblock_updown=True, use_fp16=False, use_new_attention_order=False, model_path=model_path) 
+        if model_path == "models/ffhq_10m.pt":
+            self.model = unet.create_model(image_size=256, num_channels=128, num_res_blocks=1, channel_mult="", learn_sigma=True, class_cond=False, use_checkpoint=False, attention_resolutions="16", num_heads=4, num_head_channels=64, num_heads_upsample=-1,use_scale_shift_norm=True, dropout=0, resblock_updown=True, use_fp16=False, use_new_attention_order=False, model_path=model_path) 
+            self.learn_sigma = True
+        else:
+            raise NotImplementedError(f"Unknown model config for {model_path}")
         if torch.cuda.is_available():
             self.device = 'cuda:0'
-            # self.model.load_state_dict(torch.load(model_path))
         else:
             self.device = 'cpu'
-            # self.model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
 
         # *** The following parts of init func & its assertion checks referenced from Ho et al [3] and uses configs as specified by Chung et al [2] ***
         # Retrieve betas based on beta_schedule
@@ -61,6 +63,7 @@ class DPS:
         self.ddpm_posterior_mean_xt_coeff = (self.sqrt_abars_t * self.one_minus_abars_tprev) / self.one_minus_abars_t
         self.ddpm_posterior_mean_x0_coeff = (self.sqrt_abars_tprev * betas) / self.one_minus_abars_t
         self.ddpm_posterior_var = (self.one_minus_abars_tprev / self.one_minus_abars_t) * betas
+        self.ddpm_log_posterior_var_clipped = torch.log(torch.cat(self.ddpm_posterior_var[1:2], self.ddpm_posterior_var[1:])) # *** Referenced from Ho et al. ***
 
         # Initialize only hyperparameter of DPS, the step size
         # Instead of derived 1/self.ddpm_posterior_var (eq 16), we use formulation from foot notes #5 in original DPS paper
@@ -76,35 +79,51 @@ class DPS:
         # return res.T @ lam @ res
         return torch.matmul(torch.matmul(res.T, lam), res)
 
+    def learned_range_model_log_var(self, i, learned_sigma):
+        min_log = self.posterior_log_variance_clipped[i]
+        max_log = torch.log(self.betas)[i]
+        # The model_var_values is [-1, 1] for [min_var, max_var].
+        frac = (learned_sigma + 1) / 2
+        model_log_variance = frac * max_log + (1 - frac) * min_log
+        return model_log_variance
+
     def sample_conditional_posterior(self, y):
         # y: noisy and/or nonlinear measurement of something from p_data originally, goal is to produce a valid sample from the posterior p(x|y)
         
-        # Intialize inverse problem, starting from x_N
-        # x = np.random.multivariate_normal(np.zeros(y.shape[-1]), np.identity(y.shape[-1]), size = y.shape[:3])
-        # x = np.random.normal(loc=0, scale=1, size=y.shape)
-        x = torch.randn(y.shape, device=self.device)
-        x = np.transpose(x, (0, 3, 1, 2))       
-        # x = np.transpose(x, (2, 0, 1))       
-        # x = torch.tensor(x).to(self.device)
-        print(x.shape)
+        # Intialize inverse problem, starting from x_N ~ pure noise
+        x = torch.randn_like(y, device=self.device)  # y.shape = (batch_size, height, width, channels)
 
-        # timestep_embs = unet.timestep_embedding(torch.tensor(list(range(self.N-1, 0, -1))).to(self.device), 2)
-
+        if not self.learn_sigma:
+            raise NotImplementedError(f"All known models use learn_sigma = True, fixed variance is not yet unsupported.")
+        
         pbar = tqdm(range(self.N-2, 0, -1))
         for i in pbar:
-            # s = self.model(x, timestep_embs[i])
             # Since we have learned variance, it returns 3 channels for learned mean and other 3 for learned variance of the noise
             time_i = torch.tensor([i]).to(self.device)
             s = self.model(x, time_i)
-            s_mean = s[:, :3, :, :]
-            # s_mean = np.transpose(x, (0, 2, 3, 1))       
-            s_sigma = s[:, 3:, :, :]
-            x0_hat = 1/(self.alpha_bars[i]) * (x + (self.one_minus_abars_t[i])*s_mean) # x0_hat := E[x_0 | x_t]
+            learned_mean = s[:, :3, :, :]
+            learned_sigma = s[:, 3:, :, :]
+            x0_hat = 1/(self.sqrt_abars_t[i]) * (x + torch.sqrt(self.one_minus_abars_t[i])*learned_mean) # x0_hat := E[x_0 | x_t]    
+            # *** DOES SQRT GO HERE OR NO? DDPM AND DPS DIFFER BY A SQRT!!
             
             # First do original DDPM posterior sampling for q(x_{t-1} | x_t)
-            # z = np.random.multivariate_normal(np.zeros(x.shape[-1]), np.identity(x.shape[-1]), size = x.shape)
-            z = torch.randn(x.shape, device=self.device)
-            ddpm_posterior = self.ddpm_posterior_mean_xt_coeff[i]*x + self.ddpm_posterior_mean_x0_coeff[i]*x0_hat + np.sqrt(self.ddpm_posterior_var[i])*z
+            z = torch.randn_like(x, device=self.device)
+            if i == 0:
+                z = torch.zeros_like(x)
+
+            # *** Referenced from Ho et al. ***
+            # There are a few concepts that are specified in the diffusion_config.yaml file that were not explained by neither the DDPM paper nor the DPS paper, hence we needed to reference the original DDPM code for implementation details:
+            
+            # 1. clip_denoised: True
+            x0_hat_clipped = x0_hat.clamp(-1, 1)  
+            # 2. model_var_type: learned_range
+            model_log_variance = self.learned_range_model_log_var(i, learned_sigma)
+            assert (model_log_variance.shape == x0_hat_clipped.shape == x.shape)
+
+            # Finally, needed to see what they did with the learned sigmas, which also wasn't clear just the paper:
+            sigma_i = torch.exp(0.5 * model_log_variance)
+            ddpm_posterior = self.ddpm_posterior_mean_xt_coeff[i]*x + self.ddpm_posterior_mean_x0_coeff[i]*x0_hat_clipped + sigma_i*z
+            # *** This concludes referenced parts from Ho et al. ***
             
             # Likelihood calculations
             y = np.transpose(y, (0, 3, 1, 2))  
