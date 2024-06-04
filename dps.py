@@ -90,7 +90,7 @@ class DPS:
         return torch.matmul(torch.matmul(res.T, lam), res)
 
     def learned_range_model_log_var(self, i, learned_sigma):
-        min_log = self.posterior_log_variance_clipped[i]
+        min_log = self.ddpm_log_posterior_var_clipped[i]
         max_log = torch.log(self.betas)[i]
         # The model_var_values is [-1, 1] for [min_var, max_var].
         frac = (learned_sigma + 1) / 2
@@ -144,16 +144,16 @@ class DPS:
             # Likelihood calculations for DPS
             forward_x0_hat = A_operation(x0_hat_clipped)
             res = y - forward_x0_hat
-            residual = res.detach().requires_grad_(True)
             if self.model_noise_type.lower() == 'gaussian':
-                loss = self.gaussian_loss(residual)
+                loss = self.gaussian_loss(res)
             elif self.model_noise_type.lower() == 'poisson':
-                loss = self.poisson_loss(residual, y)
+                loss = self.poisson_loss(res, y)
             else:
                 # Currently only supporting Gaussian and Poisson from DPS paper formulations
                 raise NotImplementedError(f"Unknown noise type: {self.model_noise_type}")
             grad_term = torch.autograd.grad(loss, x, create_graph=True)[0]
-            true_step = self.step_size_factor/residual # see footnotes #5 as mentioned in init function
+            print(f"Gradient term at step {i}: {grad_term}")
+            true_step = self.step_size_factor/res # see footnotes #5 as mentioned in init function
             correction_term = -true_step*grad_term
             x = ddpm_posterior + correction_term
         return x
