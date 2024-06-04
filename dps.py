@@ -1,3 +1,4 @@
+import yaml
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -22,7 +23,7 @@ class DPS:
         # Set up the model using dps_unet code (without modifications) and its corresponding model_config.yaml [2]
         self.model_noise_type = model_noise_type
         if model_path == "models/ffhq_10m.pt":
-            self.model = unet.create_model(image_size=256, num_channels=128, num_res_blocks=1, channel_mult="", learn_sigma=True, class_cond=False, use_checkpoint=False, attention_resolutions="16", num_heads=4, num_head_channels=64, num_heads_upsample=-1,use_scale_shift_norm=True, dropout=0, resblock_updown=True, use_fp16=False, use_new_attention_order=False, model_path=model_path) 
+            self.model = self.load_model(model_path)
             self.learn_sigma = True
         else:
             raise NotImplementedError(f"Unknown model config for {model_path}")
@@ -51,7 +52,7 @@ class DPS:
         self.alphas = 1. - self.betas
         self.alpha_bars = torch.cumprod(self.alphas, axis=0)
         self.alpha_bars_prev = torch.cat([torch.tensor([1.], dtype=torch.float64), self.alpha_bars[:-1]])
-        assert len(self.alpha_bars == self.alpha_bars_prev)
+        assert len(self.alpha_bars) == len(self.alpha_bars_prev)
         assert self.alpha_bars_prev.shape == (self.N,)
         # *** This concludes referenced parts from Ho et al. ***
         
@@ -63,19 +64,28 @@ class DPS:
         self.ddpm_posterior_mean_xt_coeff = (self.sqrt_abars_t * self.one_minus_abars_tprev) / self.one_minus_abars_t
         self.ddpm_posterior_mean_x0_coeff = (self.sqrt_abars_tprev * betas) / self.one_minus_abars_t
         self.ddpm_posterior_var = (self.one_minus_abars_tprev / self.one_minus_abars_t) * betas
-        self.ddpm_log_posterior_var_clipped = torch.log(torch.cat(self.ddpm_posterior_var[1:2], self.ddpm_posterior_var[1:])) # *** Referenced from Ho et al. ***
+        self.ddpm_log_posterior_var_clipped = torch.log(torch.cat((self.ddpm_posterior_var[1:2], self.ddpm_posterior_var[1:]))) # *** Referenced from Ho et al. ***
 
         # Initialize only hyperparameter of DPS, the step size
         # Instead of derived 1/self.ddpm_posterior_var (eq 16), we use formulation from foot notes #5 in original DPS paper
         # step_size = step_size_factor/||y − A(x0_hat)||, where step size factor is a constant between [0.01, 0.1]
         # Shown in Appendix C.4 (qualitatively through Figure 9) to produce more stable results 
         self.step_size_factor = 0.1
+    
+    def load_model(self, model_path="models/ffhq_10m.pt"):
+        # Models must all end with ".pt" and their config files must be modelname_config.yaml
+        with open(f"{model_path[:-3]}_config.yaml") as stream:
+            try:
+                params = yaml.safe_load(stream)
+                return unet.create_model(**params)
+            except yaml.YAMLError as exc:
+                print(exc)
 
     def gaussian_loss(self, res):
         return torch.sum(res**2)
 
     def poisson_loss(self, res, y):
-        lam = torch.diag(1/2 * y)   # [***] how to do the y_j part?
+        lam = torch.diag(1/2 * y.flatten())   # [***] how to do the y_j part? possibly a typo in the paper?
         # return res.T @ lam @ res
         return torch.matmul(torch.matmul(res.T, lam), res)
 
@@ -87,11 +97,17 @@ class DPS:
         model_log_variance = frac * max_log + (1 - frac) * min_log
         return model_log_variance
 
-    def sample_conditional_posterior(self, y):
-        # y: noisy and/or nonlinear measurement of something from p_data originally, goal is to produce a valid sample from the posterior p(x|y)
+    def sample_conditional_posterior(self, y, A_operation):
+        """
+        Performs Algorithm 1 from DPS paper [1], in which we can sample a posterior conditionally to solve inverse problems. Ie sample from p(x|y) given a noisy measurement y.
+
+         - y: noisy and/or nonlinear measurement of something from p_data originally, goal is to produce a valid sample from the posterior p(x|y)
+         - A_operation: the forward operator for the inverse problem. For eg, if the process is to mask out 30% of the image, this woudl be the function that handles the masking. 
+        """
         
         # Intialize inverse problem, starting from x_N ~ pure noise
-        x = torch.randn_like(y, device=self.device)  # y.shape = (batch_size, height, width, channels)
+        # To compute gradient wrt x later, set requires_grad = True
+        x = torch.randn_like(y, device=self.device, requires_grad=True)  # y.shape = (batch_size, height, width, channels)
 
         if not self.learn_sigma:
             raise NotImplementedError(f"All known models use learn_sigma = True, fixed variance is not yet unsupported.")
@@ -104,7 +120,7 @@ class DPS:
             learned_mean = s[:, :3, :, :]
             learned_sigma = s[:, 3:, :, :]
             x0_hat = 1/(self.sqrt_abars_t[i]) * (x + torch.sqrt(self.one_minus_abars_t[i])*learned_mean) # x0_hat := E[x_0 | x_t]    
-            # *** DOES SQRT GO HERE OR NO? DDPM AND DPS DIFFER BY A SQRT!!
+            # [***] DOES SQRT GO HERE OR NO? DDPM AND DPS DIFFER BY A SQRT!!
             
             # First do original DDPM posterior sampling for q(x_{t-1} | x_t)
             z = torch.randn_like(x, device=self.device)
@@ -125,32 +141,22 @@ class DPS:
             ddpm_posterior = self.ddpm_posterior_mean_xt_coeff[i]*x + self.ddpm_posterior_mean_x0_coeff[i]*x0_hat_clipped + sigma_i*z
             # *** This concludes referenced parts from Ho et al. ***
             
-            # Likelihood calculations
-            y = np.transpose(y, (0, 3, 1, 2))  
-            # pred_x0_hat = self.model(x0_hat, time_i)[:, :3, :, :]
-            forward_x0_hat = ??
-            res = y - pred_x0_hat
+            # Likelihood calculations for DPS
+            forward_x0_hat = A_operation(x0_hat_clipped)
+            res = y - forward_x0_hat
             residual = res.detach().requires_grad_(True)
             if self.model_noise_type.lower() == 'gaussian':
-                # grad_term = grad(self.gaussian_loss(residual)) # [***] grad ok?
                 loss = self.gaussian_loss(residual)
             elif self.model_noise_type.lower() == 'poisson':
-                # grad_term = grad(self.poisson_loss(residual, y))
                 loss = self.poisson_loss(residual, y)
             else:
                 # Currently only supporting Gaussian and Poisson from DPS paper formulations
                 raise NotImplementedError(f"Unknown noise type: {self.model_noise_type}")
-            # # grad_term = torch.autograd.grad(loss, x0_hat, create_graph=True, allow_unused=True)
-            # # print(grad_term)
-            # # print(grad_term[0])
-            # self.model.zero_grad()
-            # loss.backward()
-            grad_term = x0_hat.grad
+            grad_term = torch.autograd.grad(loss, x, create_graph=True)[0]
             true_step = self.step_size_factor/residual # see footnotes #5 as mentioned in init function
-            correction_term = true_step*grad_term
-            x = ddpm_posterior - correction_term
-        return x # [***] return x_0 or x?
-
+            correction_term = -true_step*grad_term
+            x = ddpm_posterior + correction_term
+        return x
 
 # [1]: Chung et al DPS paper: https://dps2022.github.io/diffusion-posterior-sampling-page/
 # [2]: Chung et al DPS configs (for UNet and pretrained diffusion model): https://github.com/DPS2022/diffusion-posterior-sampling/tree/effbde7325b22ce8dc3e2c06c160c021e743a12d/configs 
