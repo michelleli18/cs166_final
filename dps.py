@@ -71,7 +71,7 @@ class DPS:
         # Instead of derived 1/self.ddpm_posterior_var (eq 16), we use formulation from foot notes #5 in original DPS paper
         # step_size = step_size_factor/||y − A(x0_hat)||, where step size factor is a constant between [0.01, 0.1]
         # Shown in Appendix C.4 (qualitatively through Figure 9) to produce more stable results 
-        self.step_size_factor = 1
+        self.step_size_factor = 0
     
     def load_model(self, model_path="models/ffhq_10m.pt"):
         # Models must all end with ".pt" and their config files must be modelname_config.yaml
@@ -114,10 +114,6 @@ class DPS:
         # Intialize inverse problem, starting from x_N ~ pure noise
         # To compute gradient wrt x later, set requires_grad = True
         x = torch.randn_like(y, device=self.device, requires_grad=True)  # y.shape = (batch_size, height, width, channels)
-        x = self.rescale(x)
-        # plt.imshow(np.transpose(x.detach().numpy()[0], (1, 2, 0)))
-        # plt.axis('off')  # Turn off axis
-        # plt.show()
 
         if not self.learn_sigma:
             raise NotImplementedError(f"All known models use learn_sigma = True, fixed variance is not yet unsupported.")
@@ -133,44 +129,33 @@ class DPS:
             # [***] DOES SQRT GO HERE? DDPM AND DPS DIFFER BY A SQRT! 
             # A: yes! DPS is using s = grad(log(p(x_t))) = -1/(sqrt(1 - abar_t))*epislon
             x0_hat = 1/(self.sqrt_abars_t[i]) * (x - torch.sqrt(self.one_minus_abars_t[i])*learned_eps_mean) # x0_hat := E[x_0 | x_t] 
-            # print("x0hat", torch.min(x0_hat), torch.max(x0_hat))
-            # plt.imshow(np.transpose(x0_hat.detach().numpy()[0], (1, 2, 0)))
-            # plt.axis('off')  # Turn off axis
-            # plt.show()  
-            x0_hat = self.rescale(x0_hat) 
+            # x0_hat = self.rescale(x0_hat) 
             
             # First do original DDPM posterior sampling for q(x_{t-1} | x_t)
             z = torch.randn_like(x, device=self.device)
-            z = self.rescale(z)
+            # z = self.rescale(z)
             if i == 0:
                 z = torch.zeros_like(x)
 
             # *** Referenced from Ho et al. ***
             # There are a few concepts that are specified in the diffusion_config.yaml file that were not explained by neither the DDPM paper nor the DPS paper, hence we needed to reference the original DDPM code for implementation details:
             
-            # 1. clip_denoised: True
-            x0_hat_clipped = x0_hat.clamp(-1, 1)  
+            # # 1. clip_denoised: True
+            # x0_hat_clipped = x0_hat.clamp(-1, 1)  
             # 2. model_var_type: learned_range
             model_log_variance = self.learned_range_model_log_var(i, learned_eps_sigma)
-            assert (model_log_variance.shape == x0_hat_clipped.shape == x.shape)
+            assert (model_log_variance.shape == x0_hat.shape == x.shape)
 
             # Finally, needed to see what they did with the learned sigmas, which also wasn't clear just the paper:
             sigma_i = torch.exp(0.5 * model_log_variance)
-            ddpm_posterior = self.ddpm_posterior_mean_xt_coeff[i]*x + self.ddpm_posterior_mean_x0_coeff[i]*x0_hat_clipped + sigma_i*z
+            ddpm_posterior = self.ddpm_posterior_mean_xt_coeff[i]*x + self.ddpm_posterior_mean_x0_coeff[i]*x0_hat + sigma_i*z
             # *** This concludes referenced parts from Ho et al. ***
             print("ddpm_post", torch.min(ddpm_posterior), torch.max(ddpm_posterior))
             
             
             # Likelihood calculations for DPS
-            forward_x0_hat = A_operation(x0_hat_clipped, **A_kwargs).clamp(0, 1)  # [***] should i do clamping here or rescale it later?
-            # plt.imshow(np.transpose(forward_x0_hat.detach().numpy()[0], (1, 2, 0)))
-            # plt.axis('off')  # Turn off axis
-            # plt.show()
+            forward_x0_hat = A_operation(x0_hat, **A_kwargs)
             print("forward", torch.min(forward_x0_hat), torch.max(forward_x0_hat))
-            forward_x0_hat = self.rescale(forward_x0_hat)
-            plt.imshow(np.transpose(forward_x0_hat.detach().numpy()[0], (1, 2, 0)))
-            plt.axis('off')  # Turn off axis
-            # plt.show()
             res = torch.linalg.vector_norm(y - forward_x0_hat)
             if self.model_noise_type.lower() == 'gaussian':
                 loss = res**2
@@ -186,16 +171,15 @@ class DPS:
             correction_term = -true_step*grad_term
             print("correction_term", torch.min(correction_term), torch.max(correction_term))
             x = ddpm_posterior + correction_term
-            x = self.rescale(x)
-            # bruh = np.transpose(x.detach().numpy()[0], (1, 2, 0))
+            # x = self.rescale(x)
 
             # Detach and clear the gradient to avoid accumulating graphs
-            x = ddpm_posterior
             x = x.detach()
             x.requires_grad = True
-            torch.cuda.empty_cache()  # Clear unused memory
+            torch.cuda.empty_cache()  # Clear unused memory, [***] IS THIS NEEDED?
             if i % 50 == 0:
                 image_tools.save_image(x, f"{A_kwargs['start_h']}_{A_kwargs['start_w']}/{i}.jpg")
+        x = self.rescale(x)  # Rescale image back to 0 to 1 before saving
         return x
 
 # [1]: Chung et al DPS paper: https://dps2022.github.io/diffusion-posterior-sampling-page/

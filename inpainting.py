@@ -74,9 +74,5 @@ if __name__ == "__main__":
     box = box_type_mask(y, start_h, start_w)    
     image_tools.save_image(box, f"{inpaint_folder}/y.jpg")
 
-    # bruh = random_type(y)
-    # plt.imshow(np.transpose(bruh[0], (1, 2, 0)))
-    # plt.axis('off')
-
     x = dps.sample_conditional_posterior(box, box_type_mask, {'start_h': start_h, 'start_w': start_w})
     image_tools.save_image(x, f"{inpaint_folder}/inpainting.jpg", plot=True)
