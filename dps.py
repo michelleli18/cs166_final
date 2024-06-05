@@ -1,6 +1,7 @@
 import yaml
 import torch
 import numpy as np
+import image_tools
 from tqdm import tqdm
 from autograd import grad
 import dps_unet.unet as unet
@@ -70,7 +71,7 @@ class DPS:
         # Instead of derived 1/self.ddpm_posterior_var (eq 16), we use formulation from foot notes #5 in original DPS paper
         # step_size = step_size_factor/||y − A(x0_hat)||, where step size factor is a constant between [0.01, 0.1]
         # Shown in Appendix C.4 (qualitatively through Figure 9) to produce more stable results 
-        self.step_size_factor = 0.1
+        self.step_size_factor = 1
     
     def load_model(self, model_path="models/ffhq_10m.pt"):
         # Models must all end with ".pt" and their config files must be modelname_config.yaml
@@ -81,6 +82,19 @@ class DPS:
             except yaml.YAMLError as exc:
                 print(exc)
 
+    def rescale(self, tensor):
+        min_val = tensor.min()
+        max_val = tensor.max()
+        return (tensor - min_val) / (max_val - min_val)
+    
+    def learned_range_model_log_var(self, i, learned_sigma):
+        min_log = self.ddpm_log_posterior_var_clipped[i]
+        max_log = torch.log(self.betas)[i]
+        # The model_var_values is [-1, 1] for [min_var, max_var].
+        frac = (learned_sigma + 1) / 2
+        model_log_variance = frac * max_log + (1 - frac) * min_log
+        return model_log_variance
+    
     def gaussian_loss(self, res):
         return torch.sum(res**2)
 
@@ -89,15 +103,7 @@ class DPS:
         # return res.T @ lam @ res
         return torch.matmul(torch.matmul(res.T, lam), res)
 
-    def learned_range_model_log_var(self, i, learned_sigma):
-        min_log = self.ddpm_log_posterior_var_clipped[i]
-        max_log = torch.log(self.betas)[i]
-        # The model_var_values is [-1, 1] for [min_var, max_var].
-        frac = (learned_sigma + 1) / 2
-        model_log_variance = frac * max_log + (1 - frac) * min_log
-        return model_log_variance
-
-    def sample_conditional_posterior(self, y, A_operation):
+    def sample_conditional_posterior(self, y, A_operation, A_kwargs):
         """
         Performs Algorithm 1 from DPS paper [1], in which we can sample a posterior conditionally to solve inverse problems. Ie sample from p(x|y) given a noisy measurement y.
 
@@ -108,22 +114,34 @@ class DPS:
         # Intialize inverse problem, starting from x_N ~ pure noise
         # To compute gradient wrt x later, set requires_grad = True
         x = torch.randn_like(y, device=self.device, requires_grad=True)  # y.shape = (batch_size, height, width, channels)
+        x = self.rescale(x)
+        # plt.imshow(np.transpose(x.detach().numpy()[0], (1, 2, 0)))
+        # plt.axis('off')  # Turn off axis
+        # plt.show()
 
         if not self.learn_sigma:
             raise NotImplementedError(f"All known models use learn_sigma = True, fixed variance is not yet unsupported.")
-        
+        print("y", torch.min(y), torch.max(y))
         pbar = tqdm(range(self.N-2, 0, -1))
         for i in pbar:
+            print("x", torch.min(x), torch.max(x))
             # Since we have learned variance, it returns 3 channels for learned mean and other 3 for learned variance of the noise
             time_i = torch.tensor([i]).to(self.device)
-            s = self.model(x, time_i)
-            learned_mean = s[:, :3, :, :]
-            learned_sigma = s[:, 3:, :, :]
-            x0_hat = 1/(self.sqrt_abars_t[i]) * (x + torch.sqrt(self.one_minus_abars_t[i])*learned_mean) # x0_hat := E[x_0 | x_t]    
-            # [***] DOES SQRT GO HERE OR NO? DDPM AND DPS DIFFER BY A SQRT!!
+            learned_eps = self.model(x, time_i)
+            learned_eps_mean = learned_eps[:, :3, :, :]
+            learned_eps_sigma = learned_eps[:, 3:, :, :]
+            # [***] DOES SQRT GO HERE? DDPM AND DPS DIFFER BY A SQRT! 
+            # A: yes! DPS is using s = grad(log(p(x_t))) = -1/(sqrt(1 - abar_t))*epislon
+            x0_hat = 1/(self.sqrt_abars_t[i]) * (x - torch.sqrt(self.one_minus_abars_t[i])*learned_eps_mean) # x0_hat := E[x_0 | x_t] 
+            # print("x0hat", torch.min(x0_hat), torch.max(x0_hat))
+            # plt.imshow(np.transpose(x0_hat.detach().numpy()[0], (1, 2, 0)))
+            # plt.axis('off')  # Turn off axis
+            # plt.show()  
+            x0_hat = self.rescale(x0_hat) 
             
             # First do original DDPM posterior sampling for q(x_{t-1} | x_t)
             z = torch.randn_like(x, device=self.device)
+            z = self.rescale(z)
             if i == 0:
                 z = torch.zeros_like(x)
 
@@ -133,19 +151,29 @@ class DPS:
             # 1. clip_denoised: True
             x0_hat_clipped = x0_hat.clamp(-1, 1)  
             # 2. model_var_type: learned_range
-            model_log_variance = self.learned_range_model_log_var(i, learned_sigma)
+            model_log_variance = self.learned_range_model_log_var(i, learned_eps_sigma)
             assert (model_log_variance.shape == x0_hat_clipped.shape == x.shape)
 
             # Finally, needed to see what they did with the learned sigmas, which also wasn't clear just the paper:
             sigma_i = torch.exp(0.5 * model_log_variance)
             ddpm_posterior = self.ddpm_posterior_mean_xt_coeff[i]*x + self.ddpm_posterior_mean_x0_coeff[i]*x0_hat_clipped + sigma_i*z
             # *** This concludes referenced parts from Ho et al. ***
+            print("ddpm_post", torch.min(ddpm_posterior), torch.max(ddpm_posterior))
+            
             
             # Likelihood calculations for DPS
-            forward_x0_hat = A_operation(x0_hat_clipped)
-            res = y - forward_x0_hat
+            forward_x0_hat = A_operation(x0_hat_clipped, **A_kwargs).clamp(0, 1)  # [***] should i do clamping here or rescale it later?
+            # plt.imshow(np.transpose(forward_x0_hat.detach().numpy()[0], (1, 2, 0)))
+            # plt.axis('off')  # Turn off axis
+            # plt.show()
+            print("forward", torch.min(forward_x0_hat), torch.max(forward_x0_hat))
+            forward_x0_hat = self.rescale(forward_x0_hat)
+            plt.imshow(np.transpose(forward_x0_hat.detach().numpy()[0], (1, 2, 0)))
+            plt.axis('off')  # Turn off axis
+            # plt.show()
+            res = torch.linalg.vector_norm(y - forward_x0_hat)
             if self.model_noise_type.lower() == 'gaussian':
-                loss = self.gaussian_loss(res)
+                loss = res**2
             elif self.model_noise_type.lower() == 'poisson':
                 loss = self.poisson_loss(res, y)
             else:
@@ -154,8 +182,20 @@ class DPS:
             grad_term = torch.autograd.grad(loss, x, create_graph=True)[0]
             print(f"Gradient term at step {i}: {grad_term}")
             true_step = self.step_size_factor/res # see footnotes #5 as mentioned in init function
+            print("true_step", true_step)
             correction_term = -true_step*grad_term
+            print("correction_term", torch.min(correction_term), torch.max(correction_term))
             x = ddpm_posterior + correction_term
+            x = self.rescale(x)
+            # bruh = np.transpose(x.detach().numpy()[0], (1, 2, 0))
+
+            # Detach and clear the gradient to avoid accumulating graphs
+            x = ddpm_posterior
+            x = x.detach()
+            x.requires_grad = True
+            torch.cuda.empty_cache()  # Clear unused memory
+            if i % 50 == 0:
+                image_tools.save_image(x, f"{A_kwargs['start_h']}_{A_kwargs['start_w']}/{i}.jpg")
         return x
 
 # [1]: Chung et al DPS paper: https://dps2022.github.io/diffusion-posterior-sampling-page/
