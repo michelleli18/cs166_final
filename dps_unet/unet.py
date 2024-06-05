@@ -85,7 +85,7 @@ def create_model(
     )
 
     try:
-        model.load_state_dict(th.load(model_path, map_location='cpu'))
+        model.load_state_dict(th.load(model_path, map_location=th.device('cuda:0')))
     except Exception as e:
         print(f"Got exception: {e} / Randomly initialize")
     return model

@@ -71,7 +71,7 @@ if __name__ == "__main__":
     start_h, start_w = box_type(y)
     inpaint_folder = f"{start_h}_{start_w}"
     os.mkdir(inpaint_folder)
-    box = box_type_mask(y, start_h, start_w)    
+    box = box_type_mask(y, start_h, start_w).to('cuda:0')  
     image_tools.save_image(box, f"{inpaint_folder}/y.jpg")
 
     x = dps.sample_conditional_posterior(box, box_type_mask, {'start_h': start_h, 'start_w': start_w})
