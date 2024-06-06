@@ -2,3 +2,5 @@ models
 ffhq_1k
 dps_unet/__pycache__
 __pycache__
+test_trials
+.DS_Store
