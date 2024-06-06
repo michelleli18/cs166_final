@@ -18,7 +18,7 @@ class DPS:
      - model_path: path to the forward model
     """
 
-    def __init__(self, *, beta_schedule="linear", time_steps=1000, model_noise_type="gaussian", model_path="models/ffhq_10m.pt"):
+    def __init__(self, *, beta_schedule="linear", time_steps=1000, model_noise_type="gaussian", model_path="models/ffhq_10m.pt", step_size_factor = 0.1):
         self.N = time_steps
         if torch.cuda.is_available():
             self.device = 'cuda:0'
@@ -40,8 +40,7 @@ class DPS:
             scale = 1000 / self.N 
             beta_start = scale * 0.0001
             beta_end = scale * 0.02
-            betas = np.linspace(beta_start, beta_end, self.N, dtype=np.float64)
-            betas = torch.tensor(betas).to(self.device)
+            betas = torch.linspace(beta_start, beta_end, self.N, dtype=torch.float64).to(self.device)       
         else:
             # Currently only implemented linear because that's what the pretrained diffusion model I'm using has
             raise NotImplementedError(f"Unknown beta schedule: {beta_schedule}")
@@ -52,8 +51,8 @@ class DPS:
 
         # Calculations for alphas and alpha-bars for ease of computation later
         self.alphas = 1. - self.betas
-        self.alpha_bars = torch.tensor(np.cumprod(self.alphas.cpu(), axis=0)).to(self.device)
-        self.alpha_bars_prev = torch.tensor(np.append(1.0, self.alpha_bars.cpu().numpy()[:-1])).to(self.device)
+        self.alpha_bars = torch.cumprod(self.alphas, axis=0)
+        self.alpha_bars_prev = torch.cat([torch.tensor([1.], dtype=torch.float64).to(self.device), self.alpha_bars[:-1]])
         assert len(self.alpha_bars) == len(self.alpha_bars_prev)
         assert self.alpha_bars_prev.shape == (self.N,)
         # *** This concludes referenced parts from Ho et al. ***
@@ -72,7 +71,7 @@ class DPS:
         # Instead of derived 1/self.ddpm_posterior_var (eq 16), we use formulation from foot notes #5 in original DPS paper
         # step_size = step_size_factor/||y − A(x0_hat)||, where step size factor is a constant between [0.01, 0.1]
         # Shown in Appendix C.4 (qualitatively through Figure 9) to produce more stable results 
-        self.step_size_factor = 1
+        self.step_size_factor = step_size_factor
     
     def load_model(self, model_path="models/ffhq_10m.pt"):
         # Models must all end with ".pt" and their config files must be modelname_config.yaml
@@ -131,11 +130,9 @@ class DPS:
             # A: yes! DPS is using s = grad(log(p(x_t))) = -1/(sqrt(1 - abar_t))*epislon
             x0_hat = 1/(self.sqrt_abars_t[i]) * (x - torch.sqrt(self.one_minus_abars_t[i])*learned_eps_mean) # x0_hat := E[x_0 | x_t] 
             print("xhat", torch.min(x0_hat), torch.max(x0_hat))
-            # x0_hat = self.rescale(x0_hat) 
             
             # First do original DDPM posterior sampling for q(x_{t-1} | x_t)
             z = torch.randn_like(x, device=self.device)
-            # z = self.rescale(z)
             if i == 0:
                 z = torch.zeros_like(x)
 
@@ -173,13 +170,12 @@ class DPS:
             correction_term = -true_step*grad_term
             print("correction_term", torch.min(correction_term), torch.max(correction_term))
             x = ddpm_posterior + correction_term
-            # x = self.rescale(x)
 
             # Detach and clear the gradient to avoid accumulating graphs
             x = x.detach().clone().requires_grad_(True)
             torch.cuda.empty_cache()  # Clear unused memory, [***] IS THIS NEEDED?
-            if i % 50 == 0:
-                image_tools.save_image(x, f"{A_kwargs['start_h']}_{A_kwargs['start_w']}/{i}.jpg")
+            # if i % 50 == 0:
+            #     image_tools.save_image(x, f"{A_kwargs['start_h']}_{A_kwargs['start_w']}/{i}.jpg")
         x = self.rescale(x)  # Rescale image back to 0 to 1 before saving
         return x
 

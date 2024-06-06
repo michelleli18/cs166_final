@@ -57,22 +57,45 @@ def random_type_mask(image, mask):
     return image * mask
 
 if __name__ == "__main__":
+    # # Just generate one image with standard DPS
     dps = DPS()
-    idx = 0
-    # for image in FFHQ_dataloader
     data_iter = iter(FFHQ_dataloader)
     y = next(data_iter)
+    # start_h, start_w = box_type(y)
+    # inpaint_folder = f"{start_h}_{start_w}"
+    # os.mkdir(inpaint_folder)
+    # box = box_type_mask(y, start_h, start_w).to('cuda:0')  
+    # image_tools.save_image(box, f"{inpaint_folder}/y.jpg")
+    # x = dps.sample_conditional_posterior(box, box_type_mask, {'start_h': start_h, 'start_w': start_w})
+    # image_tools.save_image(x, f"{inpaint_folder}/inpainting_{s}.jpg", plot=True)
 
-    # # Display the image
-    # plt.imshow(np.transpose(y[0], (1, 2, 0)))
-    # plt.axis('off')  # Turn off axis
-    # plt.show()
+    # # Bounding Box Constant, Vary Factor
+    # start_h = 41
+    # start_w = 84
+    # inpaint_folder = f"{start_h}_{start_w}"
+    # os.mkdir(inpaint_folder)
+    # box = box_type_mask(y, start_h, start_w).to('cuda:0')  
+    # image_tools.save_image(box, f"{inpaint_folder}/y.jpg")
+    # step_size = [0, 0.001, 0.01, 0.1, 1.0, 10.0, 50.0]
+    # for s in step_size:
+    #     dps_obj = DPS(step_size_factor=s)
+    #     x = dps_obj.sample_conditional_posterior(box, box_type_mask, {'start_h': start_h, 'start_w': start_w})
+    #     image_tools.save_image(x, f"{inpaint_folder}/inpainting_{s}.jpg", plot=True)
 
-    start_h, start_w = box_type(y)
-    inpaint_folder = f"{start_h}_{start_w}"
-    os.mkdir(inpaint_folder)
-    box = box_type_mask(y, start_h, start_w).to('cuda:0')  
-    image_tools.save_image(box, f"{inpaint_folder}/y.jpg")
+    # # Factor Constant, Vary Image and Box
+    data_iter = iter(FFHQ_dataloader)
+    for i in range(20):
+        y = next(data_iter)
+        if i < 8:
+            continue
+        start_h, start_w = box_type(y)
+        inpaint_folder = f"{start_h}_{start_w}"
+        # os.mkdir("vary_image")
+        box = box_type_mask(y, start_h, start_w).to('cuda:0')  
+        image_tools.save_image(box, f"vary_image/y{i}_{start_h}_{start_w}.jpg")
+        x = dps.sample_conditional_posterior(box, box_type_mask, {'start_h': start_h, 'start_w': start_w})
+        image_tools.save_image(x, f"vary_image/inpainting_{i}.jpg", plot=True)
 
-    x = dps.sample_conditional_posterior(box, box_type_mask, {'start_h': start_h, 'start_w': start_w})
-    image_tools.save_image(x, f"{inpaint_folder}/inpainting.jpg", plot=True)
+    # # Generate for every image in dataset
+    # for image in FFHQ_dataloader
+    
